@@ -1,58 +1,127 @@
 // Package buyback 是回购队列：每人槽位、过期清理、价格快照与回购幂等。
-// 缺陷：每人槽位不生效、过期不清理、回购不幂等、回购价格取最新而不是最早快照、
-// 每次查询扫描全部记录。
 package buyback
+
+import "container/list"
 
 type entry struct {
 	player string
 	item   string
 	price  int
 	at     int64
+	rowEl  *list.Element
+	itemEl *list.Element
+}
+
+type playerQueue struct {
+	rows   *list.List
+	byItem map[string]*list.List
 }
 
 // Queue 是回购队列。
 type Queue struct {
 	slots   int
 	ttlMs   int64
-	items   []entry
+	players map[string]*playerQueue
 	memo    map[string]bool
 	scanned int
 }
 
 // New 建回购队列。
 func New(slots int, ttlMs int64) *Queue {
-	return &Queue{slots: slots, ttlMs: ttlMs, memo: map[string]bool{}}
+	return &Queue{
+		slots:   slots,
+		ttlMs:   ttlMs,
+		players: map[string]*playerQueue{},
+		memo:    map[string]bool{},
+	}
+}
+
+func (q *Queue) player(player string) *playerQueue {
+	pq := q.players[player]
+	if pq == nil {
+		pq = &playerQueue{rows: list.New(), byItem: map[string]*list.List{}}
+		q.players[player] = pq
+	}
+	return pq
+}
+
+func (q *Queue) expired(rec *entry, nowMs int64) bool {
+	return nowMs-rec.at >= q.ttlMs
+}
+
+// remove 从玩家链表与物品链表中同时摘除一条记录。
+func (pq *playerQueue) remove(rec *entry) {
+	pq.rows.Remove(rec.rowEl)
+	items := pq.byItem[rec.item]
+	if items != nil {
+		items.Remove(rec.itemEl)
+		if items.Len() == 0 {
+			delete(pq.byItem, rec.item)
+		}
+	}
 }
 
 // Sell 卖出一件物品，进入回购队列。
 func (q *Queue) Sell(player, item string, price int, nowMs int64) {
-	q.scanned += len(q.items)
-	q.items = append(q.items, entry{player: player, item: item, price: price, at: nowMs})
-}
-
-// Buy 回购一件物品，返回价格快照。
-func (q *Queue) Buy(player, item string, nowMs int64, reqID string) (int, bool) {
-	q.scanned += len(q.items)
-	q.memo[reqID] = true
-	price := 0
-	found := false
-	for _, rec := range q.items {
-		if rec.player == player && rec.item == item {
-			price = rec.price
-			found = true
-		}
+	pq := q.player(player)
+	rec := &entry{player: player, item: item, price: price, at: nowMs}
+	rec.rowEl = pq.rows.PushBack(rec)
+	items := pq.byItem[item]
+	if items == nil {
+		items = list.New()
+		pq.byItem[item] = items
 	}
-	return price, found
+	rec.itemEl = items.PushBack(rec)
+	if pq.rows.Len() > q.slots {
+		pq.remove(pq.rows.Front().Value.(*entry))
+	}
 }
 
-// List 返回该玩家当前可回购的物品。
+// Buy 回购一件物品，返回最早那条卖出记录的价格快照。
+func (q *Queue) Buy(player, item string, nowMs int64, reqID string) (int, bool) {
+	if q.memo[reqID] {
+		return 0, false
+	}
+	q.memo[reqID] = true
+
+	pq := q.players[player]
+	if pq == nil {
+		return 0, false
+	}
+	items := pq.byItem[item]
+	if items == nil {
+		return 0, false
+	}
+	for items.Len() > 0 {
+		rec := items.Front().Value.(*entry)
+		q.scanned++
+		if !q.expired(rec, nowMs) {
+			price := rec.price
+			pq.remove(rec)
+			return price, true
+		}
+		pq.remove(rec)
+	}
+	return 0, false
+}
+
+// List 返回该玩家当前可回购的物品，按卖出时间升序。
 func (q *Queue) List(player string, nowMs int64) []string {
-	q.scanned += len(q.items)
 	out := []string{}
-	for _, rec := range q.items {
-		if rec.player == player {
+	pq := q.players[player]
+	if pq == nil {
+		return out
+	}
+	for el := pq.rows.Front(); el != nil; {
+		rec := el.Value.(*entry)
+		next := el.Next()
+		q.scanned++
+		if q.expired(rec, nowMs) {
+			pq.remove(rec)
+		} else {
 			out = append(out, rec.item)
 		}
+		el = next
 	}
 	return out
 }
